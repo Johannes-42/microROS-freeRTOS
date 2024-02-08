@@ -8,29 +8,45 @@
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 
-#ifdef ESP_PLATFORM
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#endif
-//#include <pthread.h>
+#include <pthread.h>
+#include <sched.h>
 
 
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Aborting.\n",__LINE__,(int)temp_rc);vTaskDelete(NULL);}}
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){printf("Failed status on line %d: %d. Continuing.\n",__LINE__,(int)temp_rc);}}
 
-rcl_publisher_t publisher_1;
+rcl_publisher_t publisher;
+std_msgs__msg__Int32 msg;
 
-void thread_1(void * arg)
+void * publisher_thread(void * args)
 {
-	std_msgs__msg__Int32 msg;
-	msg.data = 0;
-	while(1){
-		RCSOFTCHECK(rcl_publish(&publisher_1, &msg, NULL));
-		msg.data++;
-		usleep(1000000);
+	rcl_publisher_t * pub = (rcl_publisher_t *) args;
+
+	std_msgs__msg__Int32 msg2 = {0};
+    	// pthread_t ptid = pthread_self();
+
+	while (1)
+	{
+		for (size_t i = 0; i < 10; i++)
+		{
+			RCSOFTCHECK(rcl_publish(pub, &msg2, NULL));
+			// printf("Sent: %d (thread: %ld)\n", msg.data, ptid);
+			msg2.data++;
+			//sleep(1);
+		}
+		usleep(100000);
+		//sched_yield();
 	}
 }
 
+void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
+{
+	RCLC_UNUSED(last_call_time);
+	if (timer != NULL) {
+		RCSOFTCHECK(rcl_publish(&publisher, &msg, NULL));
+		msg.data++;
+	}
+}
 
 void appMain(void * arg)
 {	
@@ -43,30 +59,72 @@ void appMain(void * arg)
 	// create node
 	rcl_node_t node;
 	RCCHECK(rclc_node_init_default(&node, "multithreaded_node", "", &support));
+	
+	// create publishers
+	rcl_publisher_t publishers[2];
 
 	RCCHECK(rclc_publisher_init_default(
-		&publisher_1,
+		&publishers[0],
 		&node,
 		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-		"multithread_publisher_1"));
-
+		"multithreaded_topic_1"));
+	
+	RCCHECK(rclc_publisher_init_best_effort(
+		&publishers[1],
+		&node,
+		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+		"multithreaded_topic_2"));
+		
+	// create publisher
+	RCCHECK(rclc_publisher_init_default(
+		&publisher,
+		&node,
+		ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+		"freertos_int32_publisher"));
+		
+	// create timer,
+	rcl_timer_t timer;
+	const unsigned int timer_timeout = 1000;
+	RCCHECK(rclc_timer_init_default(
+		&timer,
+		&support,
+		RCL_MS_TO_NS(timer_timeout),
+		timer_callback));
+		
 	// create executor
 	rclc_executor_t executor = rclc_executor_get_zero_initialized_executor();
-	RCCHECK(rclc_executor_init(&executor, &support.context, 0, &allocator));
+	RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+	RCCHECK(rclc_executor_add_timer(&executor, &timer));
+
+	msg.data = 0;
 
 
-	// Create publisher tasks
-	xTaskCreate(thread_1,
-            "thread_1",
-            CONFIG_MICRO_ROS_APP_STACK,
-            NULL,
-            CONFIG_MICRO_ROS_APP_TASK_PRIO,
-            NULL);
+	pthread_attr_t attr[2];
+    struct sched_param param[2];
+	for (size_t i = 0; i < 2; i++)
+	{
+		pthread_attr_init(&attr[i]);
+    	param[i].sched_priority = 5; // Adjust priority as needed
+    	pthread_attr_setschedparam(&attr[i], &param[i]);
+	}
+    
+	
+	// Create publisher threads
+	pthread_t id[2];
+	for (size_t i = 0; i < sizeof(id)/sizeof(pthread_t); i++)
+	{
+		pthread_create(&id[i], &attr[i], publisher_thread, &publishers[i]);
+	}
 
-	rclc_executor_spin(&executor);
+	while(1)
+	{
+		rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1000));
+		usleep(10000);
+		//sched_yield();
+	}
 	
 	// free resources
-	RCCHECK(rcl_publisher_fini(&publisher_1, &node))
+	// RCCHECK(rcl_publisher_fini(&publisher_1, &node))
 	RCCHECK(rcl_node_fini(&node))
 	
 	vTaskDelete(NULL);
